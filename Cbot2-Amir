@@ -1,0 +1,417 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+using cAlgo.Indicators;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.Internet)]
+    public class QuantumMomentumReactor : Robot
+    {
+        #region Parameters
+        
+        [Parameter("Lot Size", DefaultValue = 0.5, MinValue = 0.01)]
+        public double LotSize { get; set; }
+        
+        [Parameter("RSI Period", DefaultValue = 14, MinValue = 1)]
+        public int RsiPeriod { get; set; }
+        
+        [Parameter("ROC Period", DefaultValue = 5, MinValue = 1)]
+        public int RocPeriod { get; set; }
+        
+        [Parameter("SMI K Period", DefaultValue = 14, MinValue = 1)]
+        public int SmiK { get; set; }
+        
+        [Parameter("SMI D Period", DefaultValue = 3, MinValue = 1)]
+        public int SmiD { get; set; }
+        
+        [Parameter("SMI Smooth", DefaultValue = 5, MinValue = 1)]
+        public int SmiSmooth { get; set; }
+        
+        [Parameter("KAMA Length", DefaultValue = 21, MinValue = 1)]
+        public int KamaLength { get; set; }
+        
+        [Parameter("EMA50 Period", DefaultValue = 50, MinValue = 1)]
+        public int Ema50Period { get; set; }
+        
+        [Parameter("Williams %R Period", DefaultValue = 14, MinValue = 1)]
+        public int WilliamsPeriod { get; set; }
+        
+        [Parameter("Stop Loss (Pips)", DefaultValue = 17, MinValue = 5, MaxValue = 50)]
+        public int StopLossPips { get; set; }
+        
+        [Parameter("Take Profit (Pips)", DefaultValue = 35, MinValue = 10, MaxValue = 100)]
+        public int TakeProfitPips { get; set; }
+        
+        [Parameter("Max Daily Loss (%)", DefaultValue = 5.0, MinValue = 1.0, MaxValue = 10.0)]
+        public double MaxDailyLossPercent { get; set; }
+        
+        [Parameter("News Filter Minutes", DefaultValue = 5, MinValue = 0, MaxValue = 30)]
+        public int NewsFilterMinutes { get; set; }
+        
+        [Parameter("Enable Market Regime Filter", DefaultValue = true)]
+        public bool EnableMarketRegimeFilter { get; set; }
+        
+        [Parameter("ADX Period for Trend Detection", DefaultValue = 14, MinValue = 5)]
+        public int AdxPeriod { get; set; }
+        
+        [Parameter("ADX Threshold", DefaultValue = 25, MinValue = 15, MaxValue = 40)]
+        public double AdxThreshold { get; set; }
+        
+        [Parameter("Enable Low Liquidity Filter", DefaultValue = true)]
+        public bool EnableLiquidityFilter { get; set; }
+        
+        #endregion
+        
+        #region Indicators
+        
+        private RelativeStrengthIndex _rsi;
+        private ExponentialMovingAverage _kama;
+        private ExponentialMovingAverage _ema50;
+        private StochasticOscillator _stochastic;
+        private SimpleMovingAverage _smiD;
+        private WilliamsPercentR _williams;
+        private AverageDirectionalMovementIndex _adx;
+        private AverageTrueRange _atr;
+        
+        #endregion
+        
+        #region Private Variables
+        
+        private bool _inLong = false;
+        private bool _inShort = false;
+        private double _dailyStartBalance;
+        private DateTime _lastTradeDate;
+        private List<TradeResult> _tradeHistory;
+        private Dictionary<DateTime, bool> _newsEvents;
+        
+        // Performance Metrics
+        private int _totalTrades = 0;
+        private int _winningTrades = 0;
+        private double _totalProfit = 0;
+        private double _totalLoss = 0;
+        private double _maxDrawdown = 0;
+        private double _peakBalance = 0;
+        
+        #endregion
+        
+        protected override void OnStart()
+        {
+            // Initialize indicators
+            _rsi = Indicators.RelativeStrengthIndex(Bars.ClosePrices, RsiPeriod);
+            _kama = Indicators.ExponentialMovingAverage(Bars.ClosePrices, KamaLength);
+            _ema50 = Indicators.ExponentialMovingAverage(Bars.ClosePrices, Ema50Period);
+            _stochastic = Indicators.StochasticOscillator(SmiK, SmiK, SmiD);
+            _smiD = Indicators.SimpleMovingAverage(_stochastic.PercentK, SmiSmooth);
+            _williams = Indicators.WilliamsPercentR(WilliamsPeriod);
+            _adx = Indicators.AverageDirectionalMovementIndex(AdxPeriod);
+            _atr = Indicators.AverageTrueRange(14, MovingAverageType.Simple);
+            
+            // Initialize variables
+            _dailyStartBalance = Account.Balance;
+            _lastTradeDate = DateTime.MinValue;
+            _tradeHistory = new List<TradeResult>();
+            _newsEvents = new Dictionary<DateTime, bool>();
+            _peakBalance = Account.Balance;
+            
+            Print("Quantum Momentum Reactor initialized for XAUUSD");
+            Print($"Initial Balance: {Account.Balance:F2}");
+            Print($"Stop Loss: {StopLossPips} pips, Take Profit: {TakeProfitPips} pips");
+            
+            // Load news events (simplified - in production, integrate with economic calendar API)
+            LoadNewsEvents();
+        }
+        
+        protected override void OnTick()
+        {
+            // Check daily loss limit
+            if (IsDailyLossLimitReached())
+                return;
+                
+            // Check if it's a new day
+            if (Server.Time.Date != _lastTradeDate.Date)
+            {
+                _dailyStartBalance = Account.Balance;
+                PrintDailyPerformance();
+            }
+            
+            // Update performance metrics
+            UpdatePerformanceMetrics();
+            
+            // Check market conditions
+            if (!IsMarketOpen() || IsNewsTime() || (EnableLiquidityFilter && IsLowLiquidityPeriod()))
+                return;
+                
+            // Market regime filter
+            if (EnableMarketRegimeFilter && !IsTrendingMarket())
+                return;
+                
+            // Get current values
+            var currentRsi = _rsi.Result.LastValue;
+            var currentKama = _kama.Result.LastValue;
+            var currentEma50 = _ema50.Result.LastValue;
+            var previousKama = _kama.Result.Last(1);
+            var kamaSlope = currentKama - previousKama;
+            var smiK = _stochastic.PercentK.LastValue;
+            var smiDValue = _smiD.Result.LastValue;
+            var volWeightedRoc = CalculateVolumeWeightedROC();
+            
+            // KAMA color logic
+            bool kamaIsGreen = kamaSlope > 0;
+            bool kamaIsRed = kamaSlope < 0;
+            
+            // Trading conditions based on your requirements
+            bool longCondition = kamaIsGreen && currentKama > currentEma50;
+            bool shortCondition = kamaIsRed && currentKama < currentEma50;
+            
+            // Enhanced entry conditions with original indicator logic
+            bool enhancedLongCondition = longCondition && 
+                                       currentRsi < 40 && 
+                                       volWeightedRoc > 0 && 
+                                       smiK > smiDValue;
+                                       
+            bool enhancedShortCondition = shortCondition && 
+                                        currentRsi > 60 && 
+                                        volWeightedRoc < 0 && 
+                                        smiK < smiDValue;
+            
+            // Entry logic
+            if (enhancedLongCondition && !_inLong && !_inShort)
+            {
+                OpenLongPosition();
+            }
+            else if (enhancedShortCondition && !_inShort && !_inLong)
+            {
+                OpenShortPosition();
+            }
+            
+            // Exit logic
+            CheckExitConditions(currentKama, currentEma50, kamaIsGreen, kamaIsRed);
+        }
+        
+        private void OpenLongPosition()
+        {
+            var volumeInUnits = Symbol.QuantityToVolumeInUnits(LotSize);
+            var result = ExecuteMarketOrder(TradeType.Buy, SymbolName, volumeInUnits, "QMR_Long", 
+                                          StopLossPips, TakeProfitPips);
+            
+            if (result.IsSuccessful)
+            {
+                _inLong = true;
+                _inShort = false;
+                _lastTradeDate = Server.Time;
+                Print($"Long position opened at {Symbol.Bid:F5}");
+            }
+        }
+        
+        private void OpenShortPosition()
+        {
+            var volumeInUnits = Symbol.QuantityToVolumeInUnits(LotSize);
+            var result = ExecuteMarketOrder(TradeType.Sell, SymbolName, volumeInUnits, "QMR_Short", 
+                                          StopLossPips, TakeProfitPips);
+            
+            if (result.IsSuccessful)
+            {
+                _inShort = true;
+                _inLong = false;
+                _lastTradeDate = Server.Time;
+                Print($"Short position opened at {Symbol.Ask:F5}");
+            }
+        }
+        
+        private void CheckExitConditions(double currentKama, double currentEma50, bool kamaIsGreen, bool kamaIsRed)
+        {
+            var longPositions = Positions.FindAll("QMR_Long", SymbolName);
+            var shortPositions = Positions.FindAll("QMR_Short", SymbolName);
+            
+            // Long exit conditions
+            foreach (var position in longPositions)
+            {
+                // 50% exit when KAMA > EMA50 and KAMA turns red
+                if (currentKama > currentEma50 && kamaIsRed && position.VolumeInUnits > Symbol.QuantityToVolumeInUnits(LotSize * 0.5))
+                {
+                    var halfVolume = Symbol.QuantityToVolumeInUnits(LotSize * 0.5);
+                    ClosePosition(position, halfVolume);
+                    Print("50% Long position closed - KAMA turned red above EMA50");
+                }
+                
+                // Full exit when KAMA crosses below EMA50
+                if (currentKama < currentEma50)
+                {
+                    ClosePosition(position);
+                    _inLong = false;
+                    Print("Full Long position closed - KAMA below EMA50");
+                    
+                    // Immediately open short position
+                    OpenShortPosition();
+                }
+            }
+            
+            // Short exit conditions
+            foreach (var position in shortPositions)
+            {
+                // 50% exit when KAMA < EMA50 and KAMA turns green
+                if (currentKama < currentEma50 && kamaIsGreen && position.VolumeInUnits > Symbol.QuantityToVolumeInUnits(LotSize * 0.5))
+                {
+                    var halfVolume = Symbol.QuantityToVolumeInUnits(LotSize * 0.5);
+                    ClosePosition(position, halfVolume);
+                    Print("50% Short position closed - KAMA turned green below EMA50");
+                }
+                
+                // Full exit when KAMA crosses above EMA50
+                if (currentKama > currentEma50)
+                {
+                    ClosePosition(position);
+                    _inShort = false;
+                    Print("Full Short position closed - KAMA above EMA50");
+                    
+                    // Immediately open long position
+                    OpenLongPosition();
+                }
+            }
+        }
+        
+        private double CalculateVolumeWeightedROC()
+        {
+            if (Bars.Count < RocPeriod + 1)
+                return 0;
+                
+            var currentClose = Bars.ClosePrices.LastValue;
+            var previousClose = Bars.ClosePrices.Last(RocPeriod);
+            var tickROC = ((currentClose - previousClose) / previousClose) * 100;
+            
+            var volumeFactor = Bars.TickVolumes.LastValue / 1000.0;
+            return tickROC * volumeFactor;
+        }
+        
+        private bool IsTrendingMarket()
+        {
+            if (_adx.Result.Count < 2)
+                return true; // Default to allow trading if not enough data
+                
+            return _adx.Result.LastValue > AdxThreshold;
+        }
+        
+        private bool IsMarketOpen()
+        {
+            var currentTime = Server.Time;
+            var dayOfWeek = currentTime.DayOfWeek;
+            
+            // No weekend trading (FTMO compliance)
+            if (dayOfWeek == DayOfWeek.Saturday || dayOfWeek == DayOfWeek.Sunday)
+                return false;
+                
+            // Friday close at 22:00 UTC
+            if (dayOfWeek == DayOfWeek.Friday && currentTime.Hour >= 22)
+                return false;
+                
+            // Monday open at 22:00 UTC (Sunday 22:00)
+            if (dayOfWeek == DayOfWeek.Monday && currentTime.Hour < 1)
+                return false;
+                
+            return true;
+        }
+        
+        private bool IsNewsTime()
+        {
+            var currentTime = Server.Time;
+            var checkTime = currentTime.AddMinutes(-NewsFilterMinutes);
+            var futureTime = currentTime.AddMinutes(NewsFilterMinutes);
+            
+            // Check if we're within the news filter window
+            foreach (var newsEvent in _newsEvents)
+            {
+                if (newsEvent.Key >= checkTime && newsEvent.Key <= futureTime)
+                    return true;
+            }
+            
+            return false;
+        }
+        
+        private bool IsLowLiquidityPeriod()
+        {
+            var currentHour = Server.Time.Hour;
+            
+            // Avoid trading during low liquidity periods (22:00-01:00 UTC and 01:00-06:00 UTC)
+            return (currentHour >= 22 || currentHour <= 1) || (currentHour >= 1 && currentHour <= 6);
+        }
+        
+        private bool IsDailyLossLimitReached()
+        {
+            var currentLoss = (_dailyStartBalance - Account.Balance) / _dailyStartBalance * 100;
+            return currentLoss >= MaxDailyLossPercent;
+        }
+        
+        private void LoadNewsEvents()
+        {
+            // Simplified news events - in production, integrate with economic calendar API
+            // This is a placeholder for major news events
+            var today = Server.Time.Date;
+            
+            // Add some sample high-impact news times (replace with real API integration)
+            _newsEvents.Add(today.AddHours(8).AddMinutes(30), true); // Example: 8:30 UTC news
+            _newsEvents.Add(today.AddHours(12).AddMinutes(30), true); // Example: 12:30 UTC news
+            _newsEvents.Add(today.AddHours(14).AddMinutes(0), true); // Example: 14:00 UTC news
+        }
+        
+        private void UpdatePerformanceMetrics()
+        {
+            var currentBalance = Account.Balance;
+            
+            // Update peak balance and drawdown
+            if (currentBalance > _peakBalance)
+            {
+                _peakBalance = currentBalance;
+            }
+            else
+            {
+                var currentDrawdown = (_peakBalance - currentBalance) / _peakBalance * 100;
+                if (currentDrawdown > _maxDrawdown)
+                    _maxDrawdown = currentDrawdown;
+            }
+        }
+        
+        private void PrintDailyPerformance()
+        {
+            var dailyPnL = Account.Balance - _dailyStartBalance;
+            var winRate = _totalTrades > 0 ? (double)_winningTrades / _totalTrades * 100 : 0;
+            var profitFactor = _totalLoss != 0 ? _totalProfit / Math.Abs(_totalLoss) : 0;
+            
+            Print($"=== Daily Performance Report ===");
+            Print($"Daily P&L: {dailyPnL:F2}");
+            Print($"Total Trades: {_totalTrades}");
+            Print($"Win Rate: {winRate:F1}%");
+            Print($"Profit Factor: {profitFactor:F2}");
+            Print($"Max Drawdown: {_maxDrawdown:F2}%");
+            Print($"Current Balance: {Account.Balance:F2}");
+            Print($"=================================");
+        }
+        
+        protected override void OnPositionClosed(PositionClosedEventArgs args)
+        {
+            var position = args.Position;
+            _totalTrades++;
+            
+            if (position.NetProfit > 0)
+            {
+                _winningTrades++;
+                _totalProfit += position.NetProfit;
+            }
+            else
+            {
+                _totalLoss += position.NetProfit;
+            }
+            
+            Print($"Position closed: {position.TradeType} | P&L: {position.NetProfit:F2} | Total Trades: {_totalTrades}");
+        }
+        
+        protected override void OnStop()
+        {
+            Print("Quantum Momentum Reactor stopped");
+            PrintDailyPerformance();
+        }
+    }
+}
